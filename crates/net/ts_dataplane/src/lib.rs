@@ -210,53 +210,7 @@ impl DataPlane {
                 let _span =
                     tracing::trace_span!("packet_filter_inbound", n_packet = v.len()).entered();
 
-                v.retain(|pkt| {
-                    let Ok(pkt) = etherparse::SlicedPacket::from_ip(pkt.as_ref()) else {
-                        tracing::trace!("does not look like ip packet");
-                        return false;
-                    };
-
-                    let (proto, src, dst) = match pkt.net {
-                        Some(etherparse::NetSlice::Ipv4(ipv4)) => (
-                            IpProto::new(ipv4.payload().ip_number.0 as _),
-                            ipv4.header().source_addr().into(),
-                            ipv4.header().destination_addr().into(),
-                        ),
-                        Some(etherparse::NetSlice::Ipv6(ipv6)) => (
-                            IpProto::new(ipv6.payload().ip_number.0 as _),
-                            ipv6.header().source_addr().into(),
-                            ipv6.header().destination_addr().into(),
-                        ),
-                        _ => {
-                            unreachable!("unexpected packet kind");
-                        }
-                    };
-
-                    let (_src_port, dst_port) = match pkt.transport {
-                        Some(etherparse::TransportSlice::Udp(udp)) => {
-                            (udp.source_port(), udp.destination_port())
-                        }
-                        Some(etherparse::TransportSlice::Tcp(tcp)) => {
-                            (tcp.source_port(), tcp.destination_port())
-                        }
-                        _ => (0, 0),
-                    };
-
-                    let info = ts_packetfilter::PacketInfo {
-                        ip_proto: proto,
-                        port: dst_port,
-                        src,
-                        dst,
-                    };
-
-                    // TODO(npry): wire in nodecaps
-                    let caps = [];
-                    let verdict = self.packet_filter.can_access(&info, caps);
-
-                    tracing::trace!(?info, ?caps, verdict);
-
-                    verdict
-                });
+                v.retain(|pkt| inbound_filter_verdict(self.packet_filter.as_ref(), pkt.as_ref()));
 
                 v
             });
@@ -392,4 +346,125 @@ pub struct InboundResult {
 
     /// STUN packets to be handled externally.
     pub stun: Vec<PacketMut>,
+}
+
+/// Report whether an inbound overlay packet passes the packet filter.
+fn inbound_filter_verdict(
+    filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    pkt: &[u8],
+) -> bool {
+    let Ok(pkt) = etherparse::SlicedPacket::from_ip(pkt) else {
+        tracing::trace!("does not look like ip packet");
+        return false;
+    };
+
+    let (proto, src, dst) = match pkt.net {
+        Some(etherparse::NetSlice::Ipv4(ipv4)) => (
+            IpProto::new(ipv4.payload().ip_number.0 as _),
+            ipv4.header().source_addr().into(),
+            ipv4.header().destination_addr().into(),
+        ),
+        Some(etherparse::NetSlice::Ipv6(ipv6)) => (
+            IpProto::new(ipv6.payload().ip_number.0 as _),
+            ipv6.header().source_addr().into(),
+            ipv6.header().destination_addr().into(),
+        ),
+        _ => {
+            unreachable!("unexpected packet kind");
+        }
+    };
+
+    let (_src_port, dst_port) = match pkt.transport {
+        Some(etherparse::TransportSlice::Udp(udp)) => (udp.source_port(), udp.destination_port()),
+        Some(etherparse::TransportSlice::Tcp(tcp)) => {
+            // Only a bare SYN opens a connection. Every other TCP packet (SYN-ACK,
+            // ACK, data, FIN, RST) belongs to a connection and is accepted, matching
+            // Go's wgengine/filter ("tcp non-syn"). Without this, replies from a peer
+            // that policy doesn't allow to initiate connections to us are dropped, so
+            // outbound connections to such peers never complete.
+            if !tcp.syn() || tcp.ack() {
+                tracing::trace!(?src, ?dst, "accepting tcp non-syn");
+                return true;
+            }
+            (tcp.source_port(), tcp.destination_port())
+        }
+        _ => (0, 0),
+    };
+
+    let info = ts_packetfilter::PacketInfo {
+        ip_proto: proto,
+        port: dst_port,
+        src,
+        dst,
+    };
+
+    // TODO(npry): wire in nodecaps
+    let caps = [];
+    let verdict = filter.can_access(&info, caps);
+
+    tracing::trace!(?info, ?caps, verdict);
+
+    verdict
+}
+
+#[cfg(test)]
+mod tests {
+    use etherparse::PacketBuilder;
+
+    use super::inbound_filter_verdict;
+
+    const PEER: [u8; 4] = [100, 71, 220, 18];
+    const ME: [u8; 4] = [100, 94, 220, 59];
+
+    fn tcp(syn: bool, ack: bool) -> Vec<u8> {
+        let mut builder = PacketBuilder::ipv4(PEER, ME, 64).tcp(443, 51234, 1, 65535);
+        if syn {
+            builder = builder.syn();
+        }
+        if ack {
+            builder = builder.ack(1);
+        }
+        let mut out = Vec::new();
+        builder.write(&mut out, &[]).unwrap();
+        out
+    }
+
+    fn udp() -> Vec<u8> {
+        let mut out = Vec::new();
+        PacketBuilder::ipv4(PEER, ME, 64)
+            .udp(53, 51234)
+            .write(&mut out, &[])
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn bare_syn_is_subject_to_the_filter() {
+        assert!(!inbound_filter_verdict(
+            &ts_packetfilter::DropAllFilter,
+            &tcp(true, false)
+        ));
+    }
+
+    #[test]
+    fn tcp_packets_of_an_existing_connection_bypass_the_filter() {
+        for (name, pkt) in [
+            ("syn-ack", tcp(true, true)),
+            ("ack", tcp(false, true)),
+            ("no flags", tcp(false, false)),
+        ] {
+            assert!(
+                inbound_filter_verdict(&ts_packetfilter::DropAllFilter, &pkt),
+                "{name} was dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_is_still_filtered() {
+        assert!(!inbound_filter_verdict(
+            &ts_packetfilter::DropAllFilter,
+            &udp()
+        ));
+    }
 }
